@@ -1,0 +1,393 @@
+/*
+  ============================================================================
+  MUSEUM KIOSK AUDIO PLAYER * for the Broadcast Engineering Museum
+  ============================================================================
+  Hardware:
+    - Arduino Uno OR Nano
+    - MP3-TF-16P (DFPlayer Mini compatible) MP3 module
+    - HC-SR501 PIR motion sensor
+    - A physical ON/OFF switch to enable/disable PIR mode
+
+  WHAT THIS SKETCH DOES
+  ----------------------------------------------------------------------------
+  PIR MODE (switch = ENABLED):
+    - On power-up, plays one clip immediately, then goes silent.
+    - Waits for the PIR to detect a visitor.
+    - On trigger: short pause, then plays a clip (sequential or random,
+      your choice below), then goes silent again and waits for the next
+      PIR trigger.
+    - Any PIR triggers received WHILE a clip is playing (or during the
+      pre-play pause) are ignored.
+
+  LOOP MODE (switch = DISABLED):
+    - Continuously plays a clip, pauses, plays the next clip, pauses...
+      forever - in sequence (1,2,3...N,1,2,3...) or randomly, your choice.
+
+  FIXING THE "RESTARTS PARTWAY THROUGH" BUG
+  ---------------------------------------------------------------
+  Instead of using the serial "playback finished" message, which was getting 
+  missed, causing the re-issue of another play command - restarting the 
+  clip from 0:00.
+  
+  This version watches the MP3 module's hardware BUSY pin:
+      BUSY pin = LOW   while a track is actually playing
+      BUSY pin = HIGH  when idle / finished
+  This is a physical signal from the module itself, so it can't be
+  confused by a missed or corrupted serial byte. 
+
+  FOLDER / FILE NAMING CONVENTION ON THE SD CARD
+  -----------------------------------------------
+  This module uses the "play specific track from specific folder" command.
+  This requires:
+    - Folders named with 2 digits:   01, 02, 03, ... up to 10
+    - Inside EACH folder, a single file named exactly:  001.mp3
+
+  Example for 4 clips:
+      SD CARD ROOT
+        /01/001.mp3   <- clip 1
+        /02/001.mp3   <- clip 2
+        /03/001.mp3   <- clip 3
+        /04/001.mp3   <- clip 4
+
+  This is more reliable than a flat list of numbered files in the root.
+
+  WIRING / PIN USAGE
+  ----------------------------------------------------------------------------
+  Arduino Pin      Connects to                         Notes
+  -----------      -----------------------------------  ----------------------
+  Pin 10 (RX)      MP3 module TX                        Direct connection OK
+  Pin 11 (TX)      MP3 module RX                         *** SEE NOTE BELOW ***
+  Pin 4            MP3 module BUSY (sometimes "IO1")    Track playing = LOW
+  Pin 2            PIR OUT                               Also usable as INT0
+  Pin 3            PIR-enable switch (other side to GND) Uses internal pull-up
+  5V               MP3 module VCC + PIR VCC
+  GND              MP3 module GND + PIR GND + switch GND  Common ground!
+
+  *** WIRING NOTE ***
+  The MP3-TF-16P's RX pin wants a 3.3V logic level. Arduino's
+  TX pin outputs 5V. It often works fine directly, but for reliability
+  put a resistor (1k) in series between Arduino Pin 11 and the module's
+  RX pin. The module's TX -> Arduino RX (pin 10) can be wired directly.
+
+  SERIAL PORTS
+  ----------------------------------------------------------------------------
+  - Hardware Serial (USB, pins 0/1) is left free for the USB
+    debug messages (open Serial Monitor at 9600 baud).
+  - SoftwareSerial is used for talking to the MP3 module, and adds all 
+    the extra delays this slower MP3-TF-16P module needs (over the DFPlayer)
+
+  ============================================================================
+  USER SETTINGS - change these to suit your installation
+  ============================================================================
+*/
+
+#include <SoftwareSerial.h>
+
+// ---- How many clips are on the SD card? (1 to 10) ----
+const uint8_t NUM_CLIPS = 4;
+
+// ---- Playback order ----
+enum PlaybackMode { SEQUENTIAL, RANDOM_MODE };
+const PlaybackMode PLAY_MODE = SEQUENTIAL;   // change to RANDOM_MODE if wanted
+
+// ---- Pause between clips (and pause before playing after a PIR trigger) ----
+// Given in milliseconds. Examples:
+//   1 second   = 1000UL
+//   30 seconds = 30000UL
+//   5 minutes  = 300000UL
+const unsigned long PAUSE_MS = 3000UL;   // <-- set your pause duration here
+
+// ---- Volume: 0 (silent) to 30 (max) ----
+const uint8_t VOLUME_LEVEL = 20;
+
+// ============================================================================
+// PIN DEFINITIONS
+// ============================================================================
+const uint8_t MP3_RX_PIN   = 10;  // Arduino RX  <- MP3 module TX
+const uint8_t MP3_TX_PIN   = 11;  // Arduino TX  -> MP3 module RX (use series resistor)
+const uint8_t MP3_BUSY_PIN = 4;   // MP3 module BUSY pin (LOW = playing)
+const uint8_t PIR_PIN      = 2;   // PIR sensor OUTPUT
+const uint8_t PIR_SWITCH_PIN = 3; // Physical switch: LOW = PIR mode ENABLED
+
+SoftwareSerial mp3Serial(MP3_RX_PIN, MP3_TX_PIN);
+
+// ============================================================================
+// MP3-TF-16P / DFPlayer-compatible command timing
+// ============================================================================
+// This module is slower to digest commands than a genuine DFPlayer Mini.
+// Wait this long after EVERY command before sending the next one.
+const unsigned long MP3_COMMAND_DELAY_MS = 300UL;
+
+// How long to wait after sending "play" before you can start trusting the BUSY
+// pin. The module needs a while to actually start
+// playback, during which BUSY may still read HIGH (idle).
+const unsigned long BUSY_PIN_SETTLE_MS = 500UL;
+
+// ============================================================================
+// STATE MACHINE
+// ============================================================================
+enum PlayerState {
+  STATE_STARTUP,
+  STATE_IDLE_WAITING_PIR,   // PIR mode only: silent, waiting for a trigger
+  STATE_PRE_PLAY_PAUSE,     // pausing before a clip starts
+  STATE_PLAYING,            // clip is (or should be) playing - watching BUSY
+  STATE_POST_PLAY_PAUSE     // pausing after a clip finished
+};
+
+PlayerState state = STATE_STARTUP;
+unsigned long stateTimer = 0;          // millis() timestamp for timed states
+uint8_t currentClip = 0;               // 1-based clip number currently queued
+bool clipQueuedFromPIR = false;        // did this clip get queued by a PIR trigger?
+bool pirLastReading = LOW;             // for edge detection on the PIR pin
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(9600);        // USB debug serial 
+  mp3Serial.begin(9600);     // Software serial to the MP3 module
+
+  pinMode(MP3_BUSY_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(PIR_SWITCH_PIN, INPUT_PULLUP); // switch pulls LOW when ON
+
+  randomSeed(analogRead(A0)); // unconnected analog pin gives a random seed
+
+  Serial.println(F("========================================"));
+  Serial.println(F("*BEM* Museum Kiosk Audio Player - booting"));
+  Serial.print(F("Clips on card: "));
+  Serial.println(NUM_CLIPS);
+  Serial.print(F("Playback mode: "));
+  Serial.println(PLAY_MODE == SEQUENTIAL ? F("SEQUENTIAL") : F("RANDOM"));
+  Serial.print(F("Pause duration: "));
+  Serial.print(PAUSE_MS);
+  Serial.println(F(" ms"));
+  Serial.println(F("========================================"));
+
+  initialiseMp3Module();
+
+  reportPirSwitchState();
+
+  // Decide startup behaviour:
+  //   PIR enabled  -> play one clip now, then go silent and wait for PIR
+  //   PIR disabled -> go straight into the continuous play/pause loop
+  currentClip = pickNextClip();
+  clipQueuedFromPIR = false;
+  enterState(STATE_PRE_PLAY_PAUSE);
+}
+
+// ============================================================================
+// MAIN LOOP - non-blocking state machine
+// ============================================================================
+void loop() {
+  bool pirEnabled = isPirModeEnabled();
+  bool pirEdge = readPirEdge();  // true only on the instant PIR goes LOW->HIGH
+
+  switch (state) {
+
+    case STATE_IDLE_WAITING_PIR:
+      // Silent, waiting. Only reachable when PIR mode is enabled.
+      if (!pirEnabled) {
+        // Switch flipped to disabled while we were waiting - fall back
+        // to continuous loop mode.
+        Serial.println(F("PIR disabled mid-wait -> switching to loop mode"));
+        currentClip = pickNextClip();
+        clipQueuedFromPIR = false;
+        enterState(STATE_PRE_PLAY_PAUSE);
+      } else if (pirEdge) {
+        Serial.println(F("PIR triggered -> queuing clip"));
+        currentClip = pickNextClip();
+        clipQueuedFromPIR = true;
+        enterState(STATE_PRE_PLAY_PAUSE);
+      }
+      // Any other PIR triggers while idle-but-not-yet-retriggered are
+      // ignored because pirEdge only fires on a fresh LOW->HIGH
+      // transition, and it already consumed this one.
+      break;
+
+    case STATE_PRE_PLAY_PAUSE:
+      // Ignore PIR here on purpose - "any additional triggers should be
+      // ignored until the clip has finished" including this pause too.
+      if (millis() - stateTimer >= PAUSE_MS) {
+        startPlayingClip(currentClip);
+        enterState(STATE_PLAYING);
+      }
+      break;
+
+    case STATE_PLAYING:
+      // Ignore PIR here - a clip is already committed to playing.
+      if (millis() - stateTimer >= BUSY_PIN_SETTLE_MS) {
+        if (digitalRead(MP3_BUSY_PIN) == HIGH) {
+          // BUSY has gone HIGH - the module says playback has genuinely
+          // finished. This is the fix for the old restart bug: trust
+          // this hardware pin, not a timer or a serial message.
+          Serial.print(F("Clip "));
+          Serial.print(currentClip);
+          Serial.println(F(" finished playing."));
+          enterState(STATE_POST_PLAY_PAUSE);
+        }
+      }
+      break;
+
+    case STATE_POST_PLAY_PAUSE:
+      if (millis() - stateTimer >= PAUSE_MS) {
+        if (pirEnabled) {
+          Serial.println(F("Entering silent wait for next PIR trigger."));
+          enterState(STATE_IDLE_WAITING_PIR);
+        } else {
+          currentClip = pickNextClip();
+          clipQueuedFromPIR = false;
+          enterState(STATE_PRE_PLAY_PAUSE);
+        }
+      }
+      break;
+
+    case STATE_STARTUP:
+      // Never actually sits here - setup() moves it on immediately.
+      break;
+  }
+}
+
+// ============================================================================
+// INFO: change state and reset the state timer in one place
+// ============================================================================
+void enterState(PlayerState newState) {
+  state = newState;
+  stateTimer = millis();
+
+  if (newState == STATE_PRE_PLAY_PAUSE) {
+    Serial.print(F("Pausing "));
+    Serial.print(PAUSE_MS);
+    Serial.print(F(" ms before clip "));
+    Serial.println(currentClip);
+  }
+}
+
+// ============================================================================
+// INFO: pick the next clip number according to the chosen playback mode
+// ============================================================================
+uint8_t pickNextClip() {
+  static uint8_t sequentialCounter = 0; // 0-based, wraps at NUM_CLIPS
+
+  if (PLAY_MODE == RANDOM_MODE) {
+    return (uint8_t)random(1, NUM_CLIPS + 1); // random(min, maxExclusive)
+  } else {
+    uint8_t clip = sequentialCounter + 1;
+    sequentialCounter = (sequentialCounter + 1) % NUM_CLIPS;
+    return clip;
+  }
+}
+
+// ============================================================================
+// INFO: PIR switch reading (LOW = PIR mode enabled)
+// ============================================================================
+bool isPirModeEnabled() {
+  static bool lastReportedState = true; // force a report on first call
+  bool enabled = (digitalRead(PIR_SWITCH_PIN) == LOW);
+
+  if (enabled != lastReportedState) {
+    lastReportedState = enabled;
+    Serial.print(F("PIR switch changed -> PIR mode is now "));
+    Serial.println(enabled ? F("ENABLED") : F("DISABLED"));
+  }
+  return enabled;
+}
+
+void reportPirSwitchState() {
+  bool enabled = (digitalRead(PIR_SWITCH_PIN) == LOW);
+  Serial.print(F("PIR switch at startup: PIR mode is "));
+  Serial.println(enabled ? F("ENABLED") : F("DISABLED"));
+}
+
+// ============================================================================
+// INFO: PIR edge detection - returns true only once per LOW->HIGH transition
+// ============================================================================
+bool readPirEdge() {
+  bool reading = digitalRead(PIR_PIN);
+  bool triggered = false;
+
+  if (reading == HIGH && pirLastReading == LOW) {
+    triggered = true; // fresh trigger
+  }
+  pirLastReading = reading;
+  return triggered;
+}
+
+// ============================================================================
+// MP3 MODULE CONTROL
+// (Command format is the standard DFPlayer-Mini-compatible protocol, which
+//  the MP3-TF-16P also uses)
+// ============================================================================
+
+void startPlayingClip(uint8_t clipNumber) {
+  Serial.print(F("Starting playback: folder "));
+  print2Digit(clipNumber);
+  Serial.println(F(" / track 001.mp3"));
+
+  // Command 0x0F = "play specific track from specific folder"
+  // param1 = folder number, param2 = track number within that folder
+  sendMp3Command(0x0F, clipNumber, 1);
+}
+
+void initialiseMp3Module() {
+  Serial.println(F("Initialising MP3 module..."));
+
+  // Give the module time to boot / mount the SD card.
+  delay(1500);
+
+  // 0x0C = reset module
+  sendMp3Command(0x0C, 0, 0);
+  delay(1500); // module needs a longer pause after reset
+
+  // 0x09 = select playback source. param2 = 2 means TF (microSD) card.
+  sendMp3Command(0x09, 0, 2);
+  delay(500);
+
+  // 0x06 = set volume, param2 = 0-30
+  sendMp3Command(0x06, 0, VOLUME_LEVEL);
+
+  Serial.println(F("MP3 module ready."));
+}
+
+// Sends one command using the module's 10-byte packet format, then clears
+// out anything the module echoes back so a stray byte can never be
+// misread as part of the NEXT command we send. Then waits the fixed
+// settle delay this module needs before we send anything else.
+void sendMp3Command(uint8_t command, uint8_t param1, uint8_t param2) {
+  uint8_t packet[10];
+  packet[0] = 0x7E;               // start byte
+  packet[1] = 0xFF;               // version
+  packet[2] = 0x06;               // length
+  packet[3] = command;            // command byte
+  packet[4] = 0x00;               // no ACK requested
+  packet[5] = param1;             // parameter 1 (e.g. folder)
+  packet[6] = param2;             // parameter 2 (e.g. track / volume)
+
+  uint16_t checksum = 0;
+  for (uint8_t i = 1; i <= 6; i++) {
+    checksum += packet[i];
+  }
+  checksum = 0 - checksum;
+
+  packet[7] = (checksum >> 8) & 0xFF;
+  packet[8] = checksum & 0xFF;
+  packet[9] = 0xEF;               // end byte
+
+  mp3Serial.write(packet, 10);
+
+  // Clear any bytes the module sends back in reply so they can't
+  // corrupt the next command we send it.
+  delay(50);
+  while (mp3Serial.available()) {
+    mp3Serial.read();
+  }
+
+  // This module is slow to digest commands - 
+  // the same delay used everywhere in this sketch so timing stays consistent.
+  delay(MP3_COMMAND_DELAY_MS);
+}
+
+void print2Digit(uint8_t value) {
+  if (value < 10) Serial.print('0');
+  Serial.print(value);
+}
