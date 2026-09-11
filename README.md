@@ -4,3 +4,5 @@ It works in several modes: single clip playing and pausing a while in a loop, pl
 
 Different rooms require different modes of player and different pauses. 
 When powered on it reads the mode, delay and clip volume then starts playing at once to check it’s working. Then continues in the play/pause loop or pauses and waits for a trigger. The unit has a passive infrared motion sensor to detect visitors entering one of the exhibit rooms. It has an external switch to swap between loop play mode and the triggered by visitors mode.
+
+It can use a small speaker connected directly to a power amp on the MP3 module or use the L+R output into a separate amp and speakers. The later gives the option of stereo sound or if you put different audio on each leg you have dual channel synchronous effects.
