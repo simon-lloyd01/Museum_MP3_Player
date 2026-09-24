@@ -8,3 +8,5 @@ When powered on it reads the mode, delay and clip volume then starts playing at 
 It can use a small speaker connected directly to a power amp on the MP3 module or use the L+R output into a separate amp and speakers. The later gives the option of stereo sound or if you put different audio on each leg you have dual channel synchronous effects.
 
 I find myself changing modes often while working out which mode works best for different areas. So I keep uploading different settings. To avoid much of my recent pain make sure if you buy cheap Arduino clones that you buy ones with Boot Loaders. It's wasted so much time having to use an external programmer instead of just using the Arduino IDE upload button. 
+
+I wanted the finished units to look neat, so there are also a couple of very simple 3D printable cases based on modified files from thingiverse.com. These use Uno boards and not the smaller Nano, as it turned out neater to fit a proto board on top of the Uno to mount the MP3 module. in the same footprint.
